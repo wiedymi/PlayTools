@@ -2,6 +2,26 @@ import Foundation
 import UIKit
 import GameController
 
+private func appendHIDDebugLine(_ message: String) {
+    let line = "[PC-HID] \(message)"
+    let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("pc-hid.log")
+    let path = url.path
+    if !FileManager.default.fileExists(atPath: path) {
+        FileManager.default.createFile(atPath: path, contents: nil)
+    }
+    guard let handle = try? FileHandle(forWritingTo: url),
+          let data = (line + "\n").data(using: .utf8) else {
+        return
+    }
+    do {
+        try handle.seekToEnd()
+        try handle.write(contentsOf: data)
+        try handle.close()
+    } catch {
+        try? handle.close()
+    }
+}
+
 // This class is a coordinator (and module entrance), coordinating other concrete classes
 
 class PlayInput {
@@ -16,12 +36,44 @@ class PlayInput {
     }
 
     func initialize() {
+        let initLine = String(format: "PlayInput.initialize called: keymapping=%@ experimental=%@",
+                              PlaySettings.shared.keymapping ? "true" : "false",
+                              PlaySettings.shared.experimentalHIDBridge ? "true" : "false")
+        appendHIDDebugLine(initLine)
+        NSLog("[PC-HID] %@", initLine)
         // drain the dispatch queue every frame for responding to GCController events
         let displaylink = CADisplayLink(target: self, selector: #selector(drainMainDispatchQueue))
         displaylink.add(to: .main, forMode: .common)
 
         if PlaySettings.shared.disableBuiltinMouse {
             simulateGCMouseDisconnect()
+        }
+
+        logGCControllerState(prefix: "before HID bridge setup")
+        NotificationCenter.default.addObserver(
+            forName: .GCControllerDidConnect,
+            object: nil,
+            queue: .main
+        ) { notification in
+            let name = (notification.object as? GCController)?.vendorName ?? "unknown"
+            appendHIDDebugLine("GCControllerDidConnect vendor=\(name) total=\(GCController.controllers().count)")
+            NSLog("[PC-HID] GCControllerDidConnect vendor=%@ total=%d", name, GCController.controllers().count)
+        }
+        NotificationCenter.default.addObserver(
+            forName: .GCControllerDidDisconnect,
+            object: nil,
+            queue: .main
+        ) { notification in
+            let name = (notification.object as? GCController)?.vendorName ?? "unknown"
+            appendHIDDebugLine("GCControllerDidDisconnect vendor=\(name) total=\(GCController.controllers().count)")
+            NSLog("[PC-HID] GCControllerDidDisconnect vendor=%@ total=%d", name, GCController.controllers().count)
+        }
+
+        if PlaySettings.shared.experimentalHIDBridge {
+            NSLog("[PC-HID] experimental HID bridge enabled")
+            HIDControllerBridge.shared.initializeIfNeeded()
+        } else {
+            NSLog("[PC-HID] experimental HID bridge disabled")
         }
 
         if !PlaySettings.shared.keymapping {
@@ -45,6 +97,12 @@ class PlayInput {
             Toast.initialize()
         }
         mode.initialize()
+    }
+
+    private func logGCControllerState(prefix: String) {
+        let controllers = GCController.controllers()
+        appendHIDDebugLine("\(prefix): controllers=\(controllers.count)")
+        NSLog("[PC-HID] %@: controllers=%d", prefix, controllers.count)
     }
 
     private func simulateGCMouseDisconnect() {
@@ -72,5 +130,440 @@ class PlayInput {
                 mouse.mouseInput?.mouseMovedHandler = nil
             }
         }
+    }
+}
+
+private final class HIDControllerBridge {
+    static let shared = HIDControllerBridge()
+    private static let dpadUpAlias = "Direction Pad Up"
+    private static let dpadDownAlias = "Direction Pad Down"
+    private static let dpadLeftAlias = "Direction Pad Left"
+    private static let dpadRightAlias = "Direction Pad Right"
+
+    private enum HIDAxisProfile: String {
+        case undecided
+        case standard
+        case zAndRzRightStick
+    }
+
+    private enum HIDAxisRole {
+        case leftStickX
+        case leftStickY
+        case rightStickX
+        case rightStickY
+        case leftTrigger
+        case rightTrigger
+    }
+
+    private var initialized = false
+    private var virtualController: GCVirtualController?
+    private var virtualConnected = false
+    private var virtualConnecting = false
+    private var gcObserversInstalled = false
+    private var leftStick = CGPoint.zero
+    private var rightStick = CGPoint.zero
+    private var dpad = CGPoint.zero
+    private var leftTrigger: CGFloat = 0
+    private var rightTrigger: CGFloat = 0
+    private var axisProfile: HIDAxisProfile = .undecided
+    private var observedGenericAxes = Set<Int>()
+    private var dpadButtonState: [String: Bool] = [
+        HIDControllerBridge.dpadUpAlias: false,
+        HIDControllerBridge.dpadDownAlias: false,
+        HIDControllerBridge.dpadLeftAlias: false,
+        HIDControllerBridge.dpadRightAlias: false
+    ]
+    private var triggerPressedState: [String: Bool] = [
+        GCInputLeftTrigger: false,
+        GCInputRightTrigger: false
+    ]
+
+    func initializeIfNeeded() {
+        if initialized {
+            return
+        }
+        initialized = true
+        bridgeDebugLog(String(format: "HIDControllerBridge initializeIfNeeded: keymapping=%@ experimental=%@",
+                               PlaySettings.shared.keymapping ? "true" : "false",
+                               PlaySettings.shared.experimentalHIDBridge ? "true" : "false"))
+        installGCControllerObserversIfNeeded()
+        startVirtualController()
+
+        if let interface = AKInterface.shared {
+            interface.setupHIDControllerInput(onConnected: { [self] in
+                onDeviceConnected()
+            }, onDisconnected: { [self] in
+                onDeviceDisconnected()
+            }, onButton: { [self] usage, pressed in
+                onButton(usage: usage, pressed: pressed)
+            }, onAxis: { [self] usage, value in
+                onAxis(usage: usage, value: value)
+            }, onHat: { [self] hat in
+                onHat(value: hat)
+            })
+        } else {
+            bridgeDebugLog("AKInterface.shared is nil; HID bridge not attached")
+        }
+    }
+
+    private func startVirtualController() {
+        guard #available(iOS 17.0, *) else {
+            bridgeDebugLog("virtual controller unavailable: iOS < 17")
+            return
+        }
+
+        if virtualConnected {
+            bridgeDebugLog("virtual controller already connected; skipping reconnect")
+            return
+        }
+        if virtualConnecting {
+            bridgeDebugLog("virtual controller connect already in progress")
+            return
+        }
+
+        let controller: GCVirtualController
+        if let existing = virtualController {
+            controller = existing
+        } else {
+            let configuration = GCVirtualController.Configuration()
+            configuration.elements = [
+                GCInputButtonA,
+                GCInputButtonB,
+                GCInputButtonX,
+                GCInputButtonY,
+                GCInputLeftShoulder,
+                GCInputRightShoulder,
+                GCInputLeftTrigger,
+                GCInputRightTrigger,
+                GCInputDirectionPad,
+                GCInputLeftThumbstick,
+                GCInputRightThumbstick,
+                GCInputLeftThumbstickButton,
+                GCInputRightThumbstickButton,
+                GCInputButtonMenu,
+                GCInputButtonOptions
+            ]
+            configuration.isHidden = true
+            controller = GCVirtualController(configuration: configuration)
+            virtualController = controller
+        }
+
+        virtualConnecting = true
+        bridgeDebugLog("attempting virtual controller connect")
+        controller.connect { [weak self] error in
+            guard let self else {
+                return
+            }
+            self.virtualConnecting = false
+            if error == nil {
+                self.virtualConnected = true
+                self.bridgeDebugLog(String(format: "virtual controller connected (controllers=%d)",
+                                            GCController.controllers().count))
+            } else {
+                self.virtualConnected = false
+                self.bridgeDebugLog(String(format: "virtual controller connect failed: %@",
+                                            String(describing: error)))
+            }
+        }
+    }
+
+    private func onDeviceConnected() {
+        bridgeDebugLog("bridge observed HID device connected")
+        if !virtualConnected && !virtualConnecting {
+            startVirtualController()
+        }
+    }
+
+    private func onDeviceDisconnected() {
+        bridgeDebugLog("bridge observed HID device disconnected")
+        leftStick = .zero
+        rightStick = .zero
+        dpad = .zero
+        leftTrigger = 0
+        rightTrigger = 0
+        axisProfile = .undecided
+        observedGenericAxes.removeAll()
+        dpadButtonState.keys.forEach { dpadButtonState[$0] = false }
+        triggerPressedState.keys.forEach { triggerPressedState[$0] = false }
+    }
+
+    private func installGCControllerObserversIfNeeded() {
+        if gcObserversInstalled {
+            return
+        }
+        gcObserversInstalled = true
+
+        NotificationCenter.default.addObserver(
+            forName: .GCControllerDidConnect,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self else {
+                return
+            }
+            let vendor = (notification.object as? GCController)?.vendorName ?? "unknown"
+            self.bridgeDebugLog(String(format: "bridge saw GCControllerDidConnect vendor=%@ total=%d",
+                                       vendor, GCController.controllers().count))
+            if vendor == "Apple" {
+                self.virtualConnected = true
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: .GCControllerDidDisconnect,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self else {
+                return
+            }
+            let vendor = (notification.object as? GCController)?.vendorName ?? "unknown"
+            self.bridgeDebugLog(String(format: "bridge saw GCControllerDidDisconnect vendor=%@ total=%d",
+                                       vendor, GCController.controllers().count))
+            if vendor == "Apple" {
+                self.virtualConnected = false
+                self.virtualController = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(200)) { [weak self] in
+                    self?.startVirtualController()
+                }
+            }
+        }
+    }
+
+    private func shouldProcessHID() -> Bool {
+        if virtualConnected {
+            return true
+        }
+        return GCController.controllers().isEmpty
+    }
+
+    private func onButton(usage: Int, pressed: Bool) {
+        bridgeDebugLog(String(format: "bridge button usage=0x%X pressed=%@",
+                                usage, pressed ? "true" : "false"))
+        if !shouldProcessHID() {
+            return
+        }
+
+        if virtualConnected, #available(iOS 17.0, *), let virtualController,
+           let elementName = virtualButtonElement(for: usage) {
+            virtualController.setValue(pressed ? 1.0 : 0.0, forButtonElement: elementName)
+            return
+        }
+
+        if !PlaySettings.shared.keymapping {
+            return
+        }
+
+        if let alias = fallbackButtonAlias(for: usage) {
+            _ = ActionDispatcher.dispatch(key: alias, pressed: pressed)
+        }
+    }
+
+    private func onAxis(usage: Int, value: CGFloat) {
+        bridgeDebugLog(String(format: "bridge axis usage=0x%X value=%.4f", usage, value))
+        if !shouldProcessHID() {
+            return
+        }
+
+        guard let axisRole = resolveAxisRole(usage: usage, value: value) else {
+            return
+        }
+
+        switch axisRole {
+        case .leftStickX:
+            leftStick.x = value
+        case .leftStickY:
+            leftStick.y = -value
+        case .rightStickX:
+            rightStick.x = value
+        case .rightStickY:
+            rightStick.y = -value
+        case .leftTrigger:
+            leftTrigger = clamp01((value + 1) / 2)
+        case .rightTrigger:
+            rightTrigger = clamp01((value + 1) / 2)
+        }
+
+        if virtualConnected, #available(iOS 17.0, *), let virtualController {
+            switch axisRole {
+            case .leftStickX, .leftStickY:
+                virtualController.setPosition(leftStick, forDirectionPadElement: GCInputLeftThumbstick)
+            case .rightStickX, .rightStickY:
+                virtualController.setPosition(rightStick, forDirectionPadElement: GCInputRightThumbstick)
+            case .leftTrigger:
+                virtualController.setValue(leftTrigger, forButtonElement: GCInputLeftTrigger)
+            case .rightTrigger:
+                virtualController.setValue(rightTrigger, forButtonElement: GCInputRightTrigger)
+            }
+            return
+        }
+
+        if !PlaySettings.shared.keymapping {
+            return
+        }
+
+        switch axisRole {
+        case .leftStickX, .leftStickY:
+            _ = ActionDispatcher.dispatch(key: GCInputLeftThumbstick, valueX: leftStick.x, valueY: leftStick.y)
+        case .rightStickX, .rightStickY:
+            _ = ActionDispatcher.dispatch(key: GCInputRightThumbstick, valueX: rightStick.x, valueY: rightStick.y)
+        case .leftTrigger:
+            applyFallbackTrigger(alias: GCInputLeftTrigger, value: leftTrigger)
+        case .rightTrigger:
+            applyFallbackTrigger(alias: GCInputRightTrigger, value: rightTrigger)
+        }
+    }
+
+    private func resolveAxisRole(usage: Int, value: CGFloat) -> HIDAxisRole? {
+        guard [0x30, 0x31, 0x32, 0x33, 0x34, 0x35].contains(usage) else {
+            return nil
+        }
+
+        observedGenericAxes.insert(usage)
+
+        if axisProfile == .undecided {
+            if observedGenericAxes.contains(0x33) || observedGenericAxes.contains(0x34) {
+                axisProfile = .standard
+                bridgeDebugLog("axis profile selected: standard (Rx/Ry are right stick)")
+            } else if (usage == 0x32 || usage == 0x35), abs(value) < 0.25 {
+                axisProfile = .zAndRzRightStick
+                bridgeDebugLog("axis profile selected: Z/Rz are right stick (G7-style)")
+            }
+        }
+
+        switch axisProfile {
+        case .zAndRzRightStick:
+            switch usage {
+            case 0x30: return .leftStickX
+            case 0x31: return .leftStickY
+            case 0x32: return .rightStickX
+            case 0x35: return .rightStickY
+            case 0x33: return .leftTrigger
+            case 0x34: return .rightTrigger
+            default: return nil
+            }
+        case .undecided, .standard:
+            switch usage {
+            case 0x30: return .leftStickX
+            case 0x31: return .leftStickY
+            case 0x33: return .rightStickX
+            case 0x34: return .rightStickY
+            case 0x32: return .leftTrigger
+            case 0x35: return .rightTrigger
+            default: return nil
+            }
+        }
+    }
+
+    private func onHat(value: Int) {
+        bridgeDebugLog(String(format: "bridge hat value=%d", value))
+        if !shouldProcessHID() {
+            return
+        }
+
+        switch value {
+        case 0:
+            dpad = CGPoint(x: 0, y: 1)
+        case 1:
+            dpad = CGPoint(x: 1, y: 1)
+        case 2:
+            dpad = CGPoint(x: 1, y: 0)
+        case 3:
+            dpad = CGPoint(x: 1, y: -1)
+        case 4:
+            dpad = CGPoint(x: 0, y: -1)
+        case 5:
+            dpad = CGPoint(x: -1, y: -1)
+        case 6:
+            dpad = CGPoint(x: -1, y: 0)
+        case 7:
+            dpad = CGPoint(x: -1, y: 1)
+        default:
+            dpad = .zero
+        }
+
+        if virtualConnected, #available(iOS 17.0, *), let virtualController {
+            virtualController.setPosition(dpad, forDirectionPadElement: GCInputDirectionPad)
+            return
+        }
+
+        if !PlaySettings.shared.keymapping {
+            return
+        }
+
+        applyFallbackDPadState(
+            up: dpad.y > 0,
+            down: dpad.y < 0,
+            left: dpad.x < 0,
+            right: dpad.x > 0
+        )
+    }
+
+    private func applyFallbackDPadState(up: Bool, down: Bool, left: Bool, right: Bool) {
+        let nextState: [String: Bool] = [
+            HIDControllerBridge.dpadUpAlias: up,
+            HIDControllerBridge.dpadDownAlias: down,
+            HIDControllerBridge.dpadLeftAlias: left,
+            HIDControllerBridge.dpadRightAlias: right
+        ]
+
+        for (alias, pressed) in nextState where dpadButtonState[alias] != pressed {
+            _ = ActionDispatcher.dispatch(key: alias, pressed: pressed)
+        }
+        dpadButtonState = nextState
+    }
+
+    private func applyFallbackTrigger(alias: String, value: CGFloat) {
+        let pressed = value > 0.45
+        if triggerPressedState[alias] != pressed {
+            _ = ActionDispatcher.dispatch(key: alias, pressed: pressed)
+            triggerPressedState[alias] = pressed
+        }
+    }
+
+    private func virtualButtonElement(for usage: Int) -> String? {
+        switch usage {
+        case 1: return GCInputButtonA
+        case 2: return GCInputButtonB
+        case 3: return GCInputButtonX
+        case 4: return GCInputButtonY
+        case 5: return GCInputLeftShoulder
+        case 6: return GCInputRightShoulder
+        case 7: return GCInputLeftTrigger
+        case 8: return GCInputRightTrigger
+        case 9: return GCInputLeftThumbstickButton
+        case 10: return GCInputRightThumbstickButton
+        case 11: return GCInputButtonMenu
+        case 12: return GCInputButtonOptions
+        default: return nil
+        }
+    }
+
+    private func fallbackButtonAlias(for usage: Int) -> String? {
+        switch usage {
+        case 1: return GCInputButtonA
+        case 2: return GCInputButtonB
+        case 3: return GCInputButtonX
+        case 4: return GCInputButtonY
+        case 5: return GCInputLeftShoulder
+        case 6: return GCInputRightShoulder
+        case 7: return GCInputLeftTrigger
+        case 8: return GCInputRightTrigger
+        case 9: return GCInputLeftThumbstickButton
+        case 10: return GCInputRightThumbstickButton
+        case 11: return GCInputButtonMenu
+        case 12: return GCInputButtonOptions
+        default: return nil
+        }
+    }
+
+    private func clamp01(_ value: CGFloat) -> CGFloat {
+        min(max(value, 0), 1)
+    }
+
+    private func bridgeDebugLog(_ message: String) {
+        let line = "[PC-HID] \(message)"
+        NSLog("%@", line)
+        appendHIDDebugLine(message)
     }
 }

@@ -5,6 +5,7 @@
 
 #include <Foundation/Foundation.h>
 #include <errno.h>
+#include <stdio.h>
 #include <sys/sysctl.h>
 
 #import "PlayLoader.h"
@@ -286,6 +287,7 @@ DYLD_INTERPOSE(pt_usleep, usleep)
 @implementation PlayLoader
 
 static void __attribute__((constructor)) initialize(void) {
+    fprintf(stderr, "[PC-HID] PlayLoader constructor reached\n");
     [PlayCover launch];
     
     if (ue_status == 0) {
